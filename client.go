@@ -222,6 +222,7 @@ func (c *Client) DialConn(ctx context.Context, destination metadata.Socksaddr) (
 	}
 	stream, err := conn.quicConn.OpenStream()
 	if err != nil {
+		conn.releaseStream()
 		return nil, err
 	}
 	return &clientConn{
@@ -243,6 +244,7 @@ func (c *Client) ListenPacket(ctx context.Context, destination metadata.Socksadd
 	}
 	stream, err := conn.quicConn.OpenStream()
 	if err != nil {
+		conn.releaseStream()
 		return nil, err
 	}
 	return &udpPacketConn{
