@@ -21,6 +21,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -215,6 +216,10 @@ func (c *Client) DialConn(ctx context.Context, destination metadata.Socksaddr) (
 	if err != nil {
 		return nil, err
 	}
+	err = conn.acquireStream()
+	if err != nil {
+		return nil, err
+	}
 	stream, err := conn.quicConn.OpenStream()
 	if err != nil {
 		return nil, err
@@ -229,6 +234,10 @@ func (c *Client) DialConn(ctx context.Context, destination metadata.Socksaddr) (
 
 func (c *Client) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
 	conn, err := c.offer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = conn.acquireStream()
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +274,22 @@ func (c *Client) CloseWithError(err error) error {
 	return nil
 }
 
+func (c *Client) CloseIdleConnections() {
+	c.connAccess.Lock()
+	conn := c.conn
+	c.connAccess.Unlock()
+	if conn == nil {
+		return
+	}
+	conn.access.Lock()
+	conn.draining = true
+	drained := conn.streams == 0
+	conn.access.Unlock()
+	if drained {
+		conn.closeWithError(os.ErrClosed)
+	}
+}
+
 type clientOffer struct {
 	done      chan struct{}
 	cancel    func(error)
@@ -280,6 +305,9 @@ type clientQUICConnection struct {
 	closeOnce sync.Once
 	connDone  chan struct{}
 	connErr   error
+	access    sync.RWMutex
+	streams   int
+	draining  bool
 }
 
 func (c *clientQUICConnection) active() bool {
@@ -294,6 +322,29 @@ func (c *clientQUICConnection) active() bool {
 	default:
 	}
 	return true
+}
+
+func (c *clientQUICConnection) acquireStream() error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	select {
+	case <-c.connDone:
+		return exceptions.Errors(c.connErr, os.ErrClosed)
+	default:
+	}
+	c.streams++
+	c.draining = false
+	return nil
+}
+
+func (c *clientQUICConnection) releaseStream() {
+	c.access.Lock()
+	c.streams--
+	drained := c.draining && c.streams == 0
+	c.access.Unlock()
+	if drained {
+		c.closeWithError(os.ErrClosed)
+	}
 }
 
 func (c *clientQUICConnection) closeWithError(err error) {
@@ -316,6 +367,7 @@ type clientConn struct {
 	destination    metadata.Socksaddr
 	requestWritten bool
 	network        int
+	closeOnce      sync.Once
 }
 
 func (c *clientConn) NeedHandshakeForWrite() bool {
@@ -352,6 +404,7 @@ func (c *clientConn) Close() error {
 	// quic-go's Stream.Close does not unblock a Write blocked on flow control,
 	// but a past write deadline does; buffered data and the FIN are unaffected.
 	c.Stream.SetWriteDeadline(time.Now())
+	c.closeOnce.Do(c.parent.releaseStream)
 	return err
 }
 
