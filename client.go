@@ -24,6 +24,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -60,6 +61,7 @@ type Client struct {
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
+	closeIdle  atomic.Bool
 	pending    *clientOffer
 }
 
@@ -177,9 +179,10 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}
 	setCongestion(c.ctx, quicConn, c.congestionControl)
 	conn := &clientQUICConnection{
-		quicConn: quicConn,
-		rawConn:  udpConn,
-		connDone: make(chan struct{}),
+		quicConn:  quicConn,
+		rawConn:   udpConn,
+		connDone:  make(chan struct{}),
+		closeIdle: &c.closeIdle,
 	}
 	go func() {
 		hErr := c.clientHandshake(quicConn)
@@ -276,7 +279,11 @@ func (c *Client) CloseWithError(err error) error {
 	return nil
 }
 
-func (c *Client) CloseIdleConnections() {
+func (c *Client) SetKeepIdleConnections(keep bool) {
+	c.closeIdle.Store(!keep)
+	if keep {
+		return
+	}
 	c.connAccess.Lock()
 	conn := c.conn
 	c.connAccess.Unlock()
@@ -284,7 +291,6 @@ func (c *Client) CloseIdleConnections() {
 		return
 	}
 	conn.access.Lock()
-	conn.draining = true
 	drained := conn.streams == 0
 	conn.access.Unlock()
 	if drained {
@@ -309,7 +315,7 @@ type clientQUICConnection struct {
 	connErr   error
 	access    sync.RWMutex
 	streams   int
-	draining  bool
+	closeIdle *atomic.Bool
 }
 
 func (c *clientQUICConnection) active() bool {
@@ -335,14 +341,13 @@ func (c *clientQUICConnection) acquireStream() error {
 	default:
 	}
 	c.streams++
-	c.draining = false
 	return nil
 }
 
 func (c *clientQUICConnection) releaseStream() {
 	c.access.Lock()
 	c.streams--
-	drained := c.draining && c.streams == 0
+	drained := c.closeIdle.Load() && c.streams == 0
 	c.access.Unlock()
 	if drained {
 		c.closeWithError(os.ErrClosed)
